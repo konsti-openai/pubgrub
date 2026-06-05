@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use pubgrub::{
-    Dependencies, DependencyProvider, OfflineDependencyProvider, Package,
-    PackageResolutionStatistics, PubGrubError, Ranges, VersionSet, resolve,
+    DefaultStringReporter, Dependencies, DependencyProvider, DerivationTree, Derived, External,
+    Map, OfflineDependencyProvider, Package, PackageResolutionStatistics, PubGrubError, Ranges,
+    Reporter, VersionSet, resolve,
 };
 use std::convert::Infallible;
+use std::sync::Arc;
 
 type NumVS = Ranges<u32>;
 
@@ -133,4 +135,52 @@ fn same_result_across_platforms() {
     let resolution = resolve(&dependency_provider, name, ver).unwrap();
     let (p, _v) = resolution.into_iter().find(|(_p, v)| *v == 2).unwrap();
     assert_eq!(p, "0".to_string());
+}
+
+fn deep_derivation_tree(depth: usize) -> DerivationTree<String, Ranges<u32>, Infallible> {
+    let mut tree = DerivationTree::External(External::NoVersions("leaf".into(), Ranges::empty()));
+    for index in 0..depth {
+        tree = DerivationTree::Derived(Derived {
+            terms: Map::default(),
+            shared_id: None,
+            cause1: Arc::new(tree),
+            cause2: Arc::new(DerivationTree::External(External::NoVersions(
+                format!("external-{index}"),
+                Ranges::empty(),
+            ))),
+        });
+    }
+    tree
+}
+
+fn on_small_stack(
+    f: impl FnOnce(&DerivationTree<String, Ranges<u32>, Infallible>) + Send + 'static,
+) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let tree = deep_derivation_tree(1_000);
+            f(&tree);
+            // Dropping a deeply nested `Arc` is recursive too, but is independent of reporting.
+            std::mem::forget(tree);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Regression test for <https://github.com/pubgrub-rs/pubgrub/issues/293>.
+#[test]
+fn debug_deep_derivation_tree_without_stack_overflow() {
+    on_small_stack(|tree| {
+        let _ = format!("{tree:?}");
+    });
+}
+
+/// Regression test for <https://github.com/pubgrub-rs/pubgrub/issues/293>.
+#[test]
+fn report_deep_derivation_tree_without_stack_overflow() {
+    on_small_stack(|tree| {
+        let _ = DefaultStringReporter::report(tree);
+    });
 }
