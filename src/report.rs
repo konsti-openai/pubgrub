@@ -27,7 +27,7 @@ pub trait Reporter<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> 
 }
 
 /// Derivation tree resulting in the impossibility to solve the dependencies of our root package.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum DerivationTree<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
     /// External incompatibility.
     External(External<P, VS, M>),
@@ -49,7 +49,7 @@ pub enum External<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
 }
 
 /// Incompatibility derived from two others.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Derived<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
     /// Terms of the incompatibility.
     pub terms: Map<P, Term<VS>>,
@@ -62,6 +62,190 @@ pub struct Derived<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> 
     pub cause1: Arc<DerivationTree<P, VS, M>>,
     /// Second cause.
     pub cause2: Arc<DerivationTree<P, VS, M>>,
+}
+
+enum CompactDebugFrame<'a, P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
+    Tree(&'a DerivationTree<P, VS, M>),
+    Derived(&'a Derived<P, VS, M>),
+    Text(&'static str),
+}
+
+enum PrettyDebugFrame<'a, P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
+    Tree(&'a DerivationTree<P, VS, M>, usize),
+    Derived(&'a Derived<P, VS, M>, usize),
+    External(&'a External<P, VS, M>, usize),
+    Value(&'a dyn Debug, usize),
+    Indent(usize),
+    Text(&'static str),
+}
+
+fn debug_derivation_tree_compact<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display>(
+    frame: CompactDebugFrame<'_, P, VS, M>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let mut frames = vec![frame];
+    while let Some(frame) = frames.pop() {
+        match frame {
+            CompactDebugFrame::Tree(DerivationTree::External(external)) => {
+                f.write_str("External(")?;
+                Debug::fmt(external, f)?;
+                f.write_str(")")?;
+            }
+            CompactDebugFrame::Tree(DerivationTree::Derived(derived)) => {
+                f.write_str("Derived(")?;
+                frames.push(CompactDebugFrame::Text(")"));
+                frames.push(CompactDebugFrame::Derived(derived));
+            }
+            CompactDebugFrame::Derived(derived) => {
+                f.write_str("Derived { terms: ")?;
+                derived.terms.fmt(f)?;
+                f.write_str(", shared_id: ")?;
+                derived.shared_id.fmt(f)?;
+                f.write_str(", cause1: ")?;
+                frames.push(CompactDebugFrame::Text(" }"));
+                frames.push(CompactDebugFrame::Tree(&derived.cause2));
+                frames.push(CompactDebugFrame::Text(", cause2: "));
+                frames.push(CompactDebugFrame::Tree(&derived.cause1));
+            }
+            CompactDebugFrame::Text(text) => f.write_str(text)?,
+        }
+    }
+    Ok(())
+}
+
+fn debug_value_pretty(value: &dyn Debug, indent: usize, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let output = format!("{value:#?}");
+    for (line_number, line) in output.lines().enumerate() {
+        if line_number > 0 {
+            f.write_str("\n")?;
+            for _ in 0..indent {
+                f.write_str(" ")?;
+            }
+        }
+        f.write_str(line)?;
+    }
+    Ok(())
+}
+
+fn push_pretty_tuple_field<'a, P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display>(
+    frames: &mut Vec<PrettyDebugFrame<'a, P, VS, M>>,
+    value: &'a dyn Debug,
+    indent: usize,
+) {
+    frames.push(PrettyDebugFrame::Text(",\n"));
+    frames.push(PrettyDebugFrame::Value(value, indent));
+    frames.push(PrettyDebugFrame::Indent(indent));
+}
+
+fn debug_derivation_tree_pretty<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display>(
+    frame: PrettyDebugFrame<'_, P, VS, M>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let mut frames = vec![frame];
+    while let Some(frame) = frames.pop() {
+        match frame {
+            PrettyDebugFrame::Tree(DerivationTree::External(external), indent) => {
+                f.write_str("External(\n")?;
+                frames.push(PrettyDebugFrame::Text(")"));
+                frames.push(PrettyDebugFrame::Indent(indent));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::External(external, indent + 4));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+            }
+            PrettyDebugFrame::Tree(DerivationTree::Derived(derived), indent) => {
+                f.write_str("Derived(\n")?;
+                frames.push(PrettyDebugFrame::Text(")"));
+                frames.push(PrettyDebugFrame::Indent(indent));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::Derived(derived, indent + 4));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+            }
+            PrettyDebugFrame::Derived(derived, indent) => {
+                f.write_str("Derived {\n")?;
+                frames.push(PrettyDebugFrame::Text("}"));
+                frames.push(PrettyDebugFrame::Indent(indent));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::Tree(&derived.cause2, indent + 4));
+                frames.push(PrettyDebugFrame::Text("cause2: "));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::Tree(&derived.cause1, indent + 4));
+                frames.push(PrettyDebugFrame::Text("cause1: "));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::Value(&derived.shared_id, indent + 4));
+                frames.push(PrettyDebugFrame::Text("shared_id: "));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+                frames.push(PrettyDebugFrame::Text(",\n"));
+                frames.push(PrettyDebugFrame::Value(&derived.terms, indent + 4));
+                frames.push(PrettyDebugFrame::Text("terms: "));
+                frames.push(PrettyDebugFrame::Indent(indent + 4));
+            }
+            PrettyDebugFrame::External(external, indent) => match external {
+                External::NotRoot(package, version) => {
+                    f.write_str("NotRoot(\n")?;
+                    frames.push(PrettyDebugFrame::Text(")"));
+                    frames.push(PrettyDebugFrame::Indent(indent));
+                    push_pretty_tuple_field(&mut frames, version, indent + 4);
+                    push_pretty_tuple_field(&mut frames, package, indent + 4);
+                }
+                External::NoVersions(package, set) => {
+                    f.write_str("NoVersions(\n")?;
+                    frames.push(PrettyDebugFrame::Text(")"));
+                    frames.push(PrettyDebugFrame::Indent(indent));
+                    push_pretty_tuple_field(&mut frames, set, indent + 4);
+                    push_pretty_tuple_field(&mut frames, package, indent + 4);
+                }
+                External::FromDependencyOf(package, set, dependency, dependency_set) => {
+                    f.write_str("FromDependencyOf(\n")?;
+                    frames.push(PrettyDebugFrame::Text(")"));
+                    frames.push(PrettyDebugFrame::Indent(indent));
+                    push_pretty_tuple_field(&mut frames, dependency_set, indent + 4);
+                    push_pretty_tuple_field(&mut frames, dependency, indent + 4);
+                    push_pretty_tuple_field(&mut frames, set, indent + 4);
+                    push_pretty_tuple_field(&mut frames, package, indent + 4);
+                }
+                External::Custom(package, set, metadata) => {
+                    f.write_str("Custom(\n")?;
+                    frames.push(PrettyDebugFrame::Text(")"));
+                    frames.push(PrettyDebugFrame::Indent(indent));
+                    push_pretty_tuple_field(&mut frames, metadata, indent + 4);
+                    push_pretty_tuple_field(&mut frames, set, indent + 4);
+                    push_pretty_tuple_field(&mut frames, package, indent + 4);
+                }
+            },
+            PrettyDebugFrame::Value(value, indent) => debug_value_pretty(value, indent, f)?,
+            PrettyDebugFrame::Indent(indent) => {
+                for _ in 0..indent {
+                    f.write_str(" ")?;
+                }
+            }
+            PrettyDebugFrame::Text(text) => f.write_str(text)?,
+        }
+    }
+    Ok(())
+}
+
+impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Debug
+    for DerivationTree<P, VS, M>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            debug_derivation_tree_pretty(PrettyDebugFrame::Tree(self, 0), f)
+        } else {
+            debug_derivation_tree_compact(CompactDebugFrame::Tree(self), f)
+        }
+    }
+}
+
+impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Debug for Derived<P, VS, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            debug_derivation_tree_pretty(PrettyDebugFrame::Derived(self, 0), f)
+        } else {
+            debug_derivation_tree_compact(CompactDebugFrame::Derived(self), f)
+        }
+    }
 }
 
 impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree<P, VS, M> {

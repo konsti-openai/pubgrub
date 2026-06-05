@@ -6,6 +6,7 @@ use pubgrub::{
     Reporter, VersionSet, resolve,
 };
 use std::convert::Infallible;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 type NumVS = Ranges<u32>;
@@ -159,10 +160,8 @@ fn on_small_stack(
     std::thread::Builder::new()
         .stack_size(64 * 1024)
         .spawn(move || {
-            let tree = deep_derivation_tree(1_000);
+            let tree = ManuallyDrop::new(deep_derivation_tree(1_000));
             f(&tree);
-            // Dropping a deeply nested `Arc` is recursive too, but is independent of reporting.
-            std::mem::forget(tree);
         })
         .unwrap()
         .join()
@@ -174,7 +173,43 @@ fn on_small_stack(
 fn debug_deep_derivation_tree_without_stack_overflow() {
     on_small_stack(|tree| {
         let _ = format!("{tree:?}");
+        let _ = format!("{tree:#?}");
     });
+}
+
+#[test]
+fn pretty_debug_derivation_tree() {
+    let tree = DerivationTree::<String, Ranges<u32>, Infallible>::External(External::NotRoot(
+        "root".into(),
+        1,
+    ));
+    assert_eq!(
+        format!("{tree:#?}"),
+        "External(\n    NotRoot(\n        \"root\",\n        1,\n    ),\n)"
+    );
+}
+
+#[test]
+fn debug_derived_tree_format() {
+    let external = |package, version| {
+        Arc::new(DerivationTree::External(External::NotRoot(
+            package, version,
+        )))
+    };
+    let tree = DerivationTree::<String, Ranges<u32>, Infallible>::Derived(Derived {
+        terms: Map::default(),
+        shared_id: None,
+        cause1: external("a".into(), 1),
+        cause2: external("b".into(), 2),
+    });
+    assert_eq!(
+        format!("{tree:?}"),
+        "Derived(Derived { terms: {}, shared_id: None, cause1: External(NotRoot(\"a\", 1)), cause2: External(NotRoot(\"b\", 2)) })"
+    );
+    assert_eq!(
+        format!("{tree:#?}"),
+        "Derived(\n    Derived {\n        terms: {},\n        shared_id: None,\n        cause1: External(\n            NotRoot(\n                \"a\",\n                1,\n            ),\n        ),\n        cause2: External(\n            NotRoot(\n                \"b\",\n                2,\n            ),\n        ),\n    },\n)"
+    );
 }
 
 /// Regression test for <https://github.com/pubgrub-rs/pubgrub/issues/293>.
