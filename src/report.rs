@@ -252,24 +252,25 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
     /// Get all packages referred to in the derivation tree.
     pub fn packages(&self) -> Set<&P> {
         let mut packages = Set::default();
-        match self {
-            Self::External(external) => match external {
-                External::FromDependencyOf(p, _, p2, _) => {
-                    packages.insert(p);
-                    packages.insert(p2);
+        let mut trees = vec![self];
+        while let Some(tree) = trees.pop() {
+            match tree {
+                Self::External(external) => match external {
+                    External::FromDependencyOf(p, _, p2, _) => {
+                        packages.insert(p);
+                        packages.insert(p2);
+                    }
+                    External::NoVersions(p, _)
+                    | External::NotRoot(p, _)
+                    | External::Custom(p, _, _) => {
+                        packages.insert(p);
+                    }
+                },
+                Self::Derived(derived) => {
+                    packages.extend(derived.terms.keys());
+                    trees.push(&derived.cause1);
+                    trees.push(&derived.cause2);
                 }
-                External::NoVersions(p, _)
-                | External::NotRoot(p, _)
-                | External::Custom(p, _, _) => {
-                    packages.insert(p);
-                }
-            },
-            Self::Derived(derived) => {
-                // Less efficient than recursing with a `&mut Set<&P>`, but it's sufficient for
-                // small to medium-sized inputs such as a single `DerivationTree`.
-                packages.extend(derived.terms.keys());
-                packages.extend(derived.cause1.packages().iter());
-                packages.extend(derived.cause2.packages().iter());
             }
         }
         packages

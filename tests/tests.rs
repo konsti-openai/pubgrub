@@ -219,3 +219,10 @@ fn report_deep_derivation_tree_without_stack_overflow() {
         let _ = DefaultStringReporter::report(tree);
     });
 }
+
+#[test]
+fn collect_packages_from_deep_derivation_tree_without_stack_overflow() {
+    on_small_stack(|tree| {
+        assert_eq!(tree.packages().len(), 1_001);
+    });
+}
