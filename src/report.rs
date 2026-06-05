@@ -594,6 +594,31 @@ pub struct DefaultStringReporter {
     lines: Vec<String>,
 }
 
+enum ReportFrame<'a, P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
+    Build(&'a Derived<P, VS, M>),
+    FinishShared(Option<usize>),
+    PushBlank,
+    PushAndExplainRef {
+        ref_id: usize,
+        derived: &'a Derived<P, VS, M>,
+        current_terms: &'a Map<P, Term<VS>>,
+    },
+    PushAndExplainExternal {
+        external: &'a External<P, VS, M>,
+        current_terms: &'a Map<P, Term<VS>>,
+    },
+    PushAndExplainPriorAndExternal {
+        prior_external: &'a External<P, VS, M>,
+        external: &'a External<P, VS, M>,
+        current_terms: &'a Map<P, Term<VS>>,
+    },
+    ContinueBothUnreferenced {
+        derived1: &'a Derived<P, VS, M>,
+        derived2: &'a Derived<P, VS, M>,
+        current_terms: &'a Map<P, Term<VS>>,
+    },
+}
+
 impl DefaultStringReporter {
     /// Initialize the reporter.
     fn new() -> Self {
@@ -604,7 +629,7 @@ impl DefaultStringReporter {
         }
     }
 
-    fn build_recursive<
+    fn build<
         P: Package,
         VS: VersionSet,
         M: Eq + Clone + Debug + Display,
@@ -614,166 +639,151 @@ impl DefaultStringReporter {
         derived: &Derived<P, VS, M>,
         formatter: &F,
     ) {
-        self.build_recursive_helper(derived, formatter);
-        if let Some(id) = derived.shared_id {
-            #[allow(clippy::map_entry)] // `add_line_ref` not compatible with proposed fix.
-            if !self.shared_with_ref.contains_key(&id) {
-                self.add_line_ref();
-                self.shared_with_ref.insert(id, self.ref_count);
-            }
-        };
-    }
-
-    fn build_recursive_helper<
-        P: Package,
-        VS: VersionSet,
-        M: Eq + Clone + Debug + Display,
-        F: ReportFormatter<P, VS, M, Output = String>,
-    >(
-        &mut self,
-        current: &Derived<P, VS, M>,
-        formatter: &F,
-    ) {
-        match (current.cause1.deref(), current.cause2.deref()) {
-            (DerivationTree::External(external1), DerivationTree::External(external2)) => {
-                // Simplest case, we just combine two external incompatibilities.
-                self.lines.push(formatter.explain_both_external(
-                    external1,
-                    external2,
-                    &current.terms,
-                ));
-            }
-            (DerivationTree::Derived(derived), DerivationTree::External(external)) => {
-                // One cause is derived, so we explain this first
-                // then we add the one-line external part
-                // and finally conclude with the current incompatibility.
-                self.report_one_each(derived, external, &current.terms, formatter);
-            }
-            (DerivationTree::External(external), DerivationTree::Derived(derived)) => {
-                self.report_one_each(derived, external, &current.terms, formatter);
-            }
-            (DerivationTree::Derived(derived1), DerivationTree::Derived(derived2)) => {
-                // This is the most complex case since both causes are also derived.
-                match (
-                    self.line_ref_of(derived1.shared_id),
-                    self.line_ref_of(derived2.shared_id),
-                ) {
-                    // If both causes already have been referenced (shared_id),
-                    // the explanation simply uses those references.
-                    (Some(ref1), Some(ref2)) => self.lines.push(formatter.explain_both_ref(
-                        ref1,
-                        derived1,
-                        ref2,
-                        derived2,
-                        &current.terms,
-                    )),
-                    // Otherwise, if one only has a line number reference,
-                    // we recursively call the one without reference and then
-                    // add the one with reference to conclude.
-                    (Some(ref1), None) => {
-                        self.build_recursive(derived2, formatter);
-                        self.lines
-                            .push(formatter.and_explain_ref(ref1, derived1, &current.terms));
-                    }
-                    (None, Some(ref2)) => {
-                        self.build_recursive(derived1, formatter);
-                        self.lines
-                            .push(formatter.and_explain_ref(ref2, derived2, &current.terms));
-                    }
-                    // Finally, if no line reference exists yet,
-                    // we call recursively the first one and then,
-                    //   - if this was a shared node, it will get a line ref
-                    //     and we can simply recall this with the current node.
-                    //   - otherwise, we add a line reference to it,
-                    //     recursively call on the second node,
-                    //     and finally conclude.
-                    (None, None) => {
-                        self.build_recursive(derived1, formatter);
-                        if derived1.shared_id.is_some() {
-                            self.lines.push("".into());
-                            self.build_recursive(current, formatter);
-                        } else {
-                            self.add_line_ref();
-                            let ref1 = self.ref_count;
-                            self.lines.push("".into());
-                            self.build_recursive(derived2, formatter);
-                            self.lines.push(formatter.and_explain_ref(
-                                ref1,
-                                derived1,
-                                &current.terms,
-                            ));
+        let mut frames = vec![ReportFrame::Build(derived)];
+        while let Some(frame) = frames.pop() {
+            match frame {
+                ReportFrame::Build(current) => {
+                    frames.push(ReportFrame::FinishShared(current.shared_id));
+                    match (current.cause1.deref(), current.cause2.deref()) {
+                        (
+                            DerivationTree::External(external1),
+                            DerivationTree::External(external2),
+                        ) => self.lines.push(formatter.explain_both_external(
+                            external1,
+                            external2,
+                            &current.terms,
+                        )),
+                        (DerivationTree::Derived(derived), DerivationTree::External(external))
+                        | (DerivationTree::External(external), DerivationTree::Derived(derived)) => {
+                            match self.line_ref_of(derived.shared_id) {
+                                Some(ref_id) => {
+                                    self.lines.push(formatter.explain_ref_and_external(
+                                        ref_id,
+                                        derived,
+                                        external,
+                                        &current.terms,
+                                    ));
+                                }
+                                None => match (derived.cause1.deref(), derived.cause2.deref()) {
+                                    (
+                                        DerivationTree::Derived(prior_derived),
+                                        DerivationTree::External(prior_external),
+                                    )
+                                    | (
+                                        DerivationTree::External(prior_external),
+                                        DerivationTree::Derived(prior_derived),
+                                    ) => {
+                                        frames.push(ReportFrame::PushAndExplainPriorAndExternal {
+                                            prior_external,
+                                            external,
+                                            current_terms: &current.terms,
+                                        });
+                                        frames.push(ReportFrame::Build(prior_derived));
+                                    }
+                                    _ => {
+                                        frames.push(ReportFrame::PushAndExplainExternal {
+                                            external,
+                                            current_terms: &current.terms,
+                                        });
+                                        frames.push(ReportFrame::Build(derived));
+                                    }
+                                },
+                            }
+                        }
+                        (DerivationTree::Derived(derived1), DerivationTree::Derived(derived2)) => {
+                            match (
+                                self.line_ref_of(derived1.shared_id),
+                                self.line_ref_of(derived2.shared_id),
+                            ) {
+                                (Some(ref1), Some(ref2)) => {
+                                    self.lines.push(formatter.explain_both_ref(
+                                        ref1,
+                                        derived1,
+                                        ref2,
+                                        derived2,
+                                        &current.terms,
+                                    ));
+                                }
+                                (Some(ref1), None) => {
+                                    frames.push(ReportFrame::PushAndExplainRef {
+                                        ref_id: ref1,
+                                        derived: derived1,
+                                        current_terms: &current.terms,
+                                    });
+                                    frames.push(ReportFrame::Build(derived2));
+                                }
+                                (None, Some(ref2)) => {
+                                    frames.push(ReportFrame::PushAndExplainRef {
+                                        ref_id: ref2,
+                                        derived: derived2,
+                                        current_terms: &current.terms,
+                                    });
+                                    frames.push(ReportFrame::Build(derived1));
+                                }
+                                (None, None) if derived1.shared_id.is_some() => {
+                                    frames.push(ReportFrame::Build(current));
+                                    frames.push(ReportFrame::PushBlank);
+                                    frames.push(ReportFrame::Build(derived1));
+                                }
+                                (None, None) => {
+                                    frames.push(ReportFrame::ContinueBothUnreferenced {
+                                        derived1,
+                                        derived2,
+                                        current_terms: &current.terms,
+                                    });
+                                    frames.push(ReportFrame::Build(derived1));
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
-    }
-
-    /// Report a derived and an external incompatibility.
-    ///
-    /// The result will depend on the fact that the derived incompatibility
-    /// has already been explained or not.
-    fn report_one_each<
-        P: Package,
-        VS: VersionSet,
-        M: Eq + Clone + Debug + Display,
-        F: ReportFormatter<P, VS, M, Output = String>,
-    >(
-        &mut self,
-        derived: &Derived<P, VS, M>,
-        external: &External<P, VS, M>,
-        current_terms: &Map<P, Term<VS>>,
-        formatter: &F,
-    ) {
-        match self.line_ref_of(derived.shared_id) {
-            Some(ref_id) => self.lines.push(formatter.explain_ref_and_external(
-                ref_id,
-                derived,
-                external,
-                current_terms,
-            )),
-            None => self.report_recurse_one_each(derived, external, current_terms, formatter),
-        }
-    }
-
-    /// Report one derived (without a line ref yet) and one external.
-    fn report_recurse_one_each<
-        P: Package,
-        VS: VersionSet,
-        M: Eq + Clone + Debug + Display,
-        F: ReportFormatter<P, VS, M, Output = String>,
-    >(
-        &mut self,
-        derived: &Derived<P, VS, M>,
-        external: &External<P, VS, M>,
-        current_terms: &Map<P, Term<VS>>,
-        formatter: &F,
-    ) {
-        match (derived.cause1.deref(), derived.cause2.deref()) {
-            // If the derived cause has itself one external prior cause,
-            // we can chain the external explanations.
-            (DerivationTree::Derived(prior_derived), DerivationTree::External(prior_external)) => {
-                self.build_recursive(prior_derived, formatter);
-                self.lines.push(formatter.and_explain_prior_and_external(
+                ReportFrame::FinishShared(shared_id) => {
+                    if let Some(id) = shared_id {
+                        #[allow(clippy::map_entry)] // `add_line_ref` needs mutable `self`.
+                        if !self.shared_with_ref.contains_key(&id) {
+                            self.add_line_ref();
+                            self.shared_with_ref.insert(id, self.ref_count);
+                        }
+                    }
+                }
+                ReportFrame::PushBlank => self.lines.push(String::new()),
+                ReportFrame::PushAndExplainRef {
+                    ref_id,
+                    derived,
+                    current_terms,
+                } => self
+                    .lines
+                    .push(formatter.and_explain_ref(ref_id, derived, current_terms)),
+                ReportFrame::PushAndExplainExternal {
+                    external,
+                    current_terms,
+                } => self
+                    .lines
+                    .push(formatter.and_explain_external(external, current_terms)),
+                ReportFrame::PushAndExplainPriorAndExternal {
                     prior_external,
                     external,
                     current_terms,
-                ));
-            }
-            // If the derived cause has itself one external prior cause,
-            // we can chain the external explanations.
-            (DerivationTree::External(prior_external), DerivationTree::Derived(prior_derived)) => {
-                self.build_recursive(prior_derived, formatter);
-                self.lines.push(formatter.and_explain_prior_and_external(
+                } => self.lines.push(formatter.and_explain_prior_and_external(
                     prior_external,
                     external,
                     current_terms,
-                ));
-            }
-            _ => {
-                self.build_recursive(derived, formatter);
-                self.lines
-                    .push(formatter.and_explain_external(external, current_terms));
+                )),
+                ReportFrame::ContinueBothUnreferenced {
+                    derived1,
+                    derived2,
+                    current_terms,
+                } => {
+                    self.add_line_ref();
+                    let ref1 = self.ref_count;
+                    self.lines.push(String::new());
+                    frames.push(ReportFrame::PushAndExplainRef {
+                        ref_id: ref1,
+                        derived: derived1,
+                        current_terms,
+                    });
+                    frames.push(ReportFrame::Build(derived2));
+                }
             }
         }
     }
@@ -804,7 +814,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Reporter<P, VS
             DerivationTree::External(external) => formatter.format_external(external),
             DerivationTree::Derived(derived) => {
                 let mut reporter = Self::new();
-                reporter.build_recursive(derived, &formatter);
+                reporter.build(derived, &formatter);
                 reporter.lines.join("\n")
             }
         }
@@ -818,7 +828,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Reporter<P, VS
             DerivationTree::External(external) => formatter.format_external(external),
             DerivationTree::Derived(derived) => {
                 let mut reporter = Self::new();
-                reporter.build_recursive(derived, formatter);
+                reporter.build(derived, formatter);
                 reporter.lines.join("\n")
             }
         }
