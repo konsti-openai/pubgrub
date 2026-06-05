@@ -248,6 +248,32 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Debug for Deri
     }
 }
 
+struct PendingNoVersions<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
+    terms: Map<P, Term<VS>>,
+    shared_id: Option<usize>,
+    no_versions: Arc<DerivationTree<P, VS, M>>,
+    no_versions_first: bool,
+    package: P,
+    set: VS,
+}
+
+impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> PendingNoVersions<P, VS, M> {
+    fn wrap(self, other: DerivationTree<P, VS, M>) -> DerivationTree<P, VS, M> {
+        let other = Arc::new(other);
+        let (cause1, cause2) = if self.no_versions_first {
+            (self.no_versions, other)
+        } else {
+            (other, self.no_versions)
+        };
+        DerivationTree::Derived(Derived {
+            terms: self.terms,
+            shared_id: self.shared_id,
+            cause1,
+            cause2,
+        })
+    }
+}
+
 impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree<P, VS, M> {
     /// Get all packages referred to in the derivation tree.
     pub fn packages(&self) -> Set<&P> {
@@ -285,32 +311,116 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
     /// was not run in some kind of offline mode that may not
     /// have access to all versions existing.
     pub fn collapse_no_versions(&mut self) {
-        match self {
-            DerivationTree::External(_) => {}
-            DerivationTree::Derived(derived) => {
-                match (
-                    Arc::make_mut(&mut derived.cause1),
-                    Arc::make_mut(&mut derived.cause2),
-                ) {
-                    (DerivationTree::External(External::NoVersions(p, r)), ref mut cause2) => {
-                        cause2.collapse_no_versions();
-                        *self = cause2
+        self.assert_no_versions_not_root();
+        let mut trees = vec![self];
+        while let Some(tree) = trees.pop() {
+            let mut pending: Vec<PendingNoVersions<P, VS, M>> = Vec::new();
+            loop {
+                let DerivationTree::Derived(derived) = tree else {
+                    while let Some(frame) = pending.pop() {
+                        if let Some(replacement) = tree
                             .clone()
-                            .merge_no_versions(p.to_owned(), r.to_owned())
-                            .unwrap_or_else(|| self.to_owned());
+                            .merge_no_versions(frame.package.clone(), frame.set.clone())
+                        {
+                            *tree = replacement;
+                        } else {
+                            *tree = frame.wrap(tree.clone());
+                            pending.clear();
+                            break;
+                        }
                     }
-                    (ref mut cause1, DerivationTree::External(External::NoVersions(p, r))) => {
-                        cause1.collapse_no_versions();
-                        *self = cause1
+                    break;
+                };
+
+                let derived_replacement = match (derived.cause1.deref(), derived.cause2.deref()) {
+                    (
+                        DerivationTree::External(External::NoVersions(package, set)),
+                        other @ DerivationTree::Derived(_),
+                    ) => Some((true, package.clone(), set.clone(), other.clone())),
+                    (
+                        other @ DerivationTree::Derived(_),
+                        DerivationTree::External(External::NoVersions(package, set)),
+                    ) => Some((false, package.clone(), set.clone(), other.clone())),
+                    _ => None,
+                };
+
+                if let Some((no_versions_first, package, set, replacement)) = derived_replacement {
+                    let frame = PendingNoVersions {
+                        terms: std::mem::take(&mut derived.terms),
+                        shared_id: derived.shared_id,
+                        no_versions: if no_versions_first {
+                            Arc::clone(&derived.cause1)
+                        } else {
+                            Arc::clone(&derived.cause2)
+                        },
+                        no_versions_first,
+                        package,
+                        set,
+                    };
+                    *tree = replacement;
+                    pending.push(frame);
+                    continue;
+                }
+
+                let external_merge = match (derived.cause1.deref(), derived.cause2.deref()) {
+                    (
+                        DerivationTree::External(External::NoVersions(package, set)),
+                        other @ DerivationTree::External(_),
+                    ) => Some(
+                        other
                             .clone()
-                            .merge_no_versions(p.to_owned(), r.to_owned())
-                            .unwrap_or_else(|| self.to_owned());
+                            .merge_no_versions(package.clone(), set.clone()),
+                    ),
+                    (
+                        other @ DerivationTree::External(_),
+                        DerivationTree::External(External::NoVersions(package, set)),
+                    ) => Some(
+                        other
+                            .clone()
+                            .merge_no_versions(package.clone(), set.clone()),
+                    ),
+                    _ => None,
+                };
+
+                match external_merge {
+                    Some(Some(replacement)) => {
+                        *tree = replacement;
                     }
-                    _ => {
-                        Arc::make_mut(&mut derived.cause1).collapse_no_versions();
-                        Arc::make_mut(&mut derived.cause2).collapse_no_versions();
+                    Some(None) => break,
+                    None => {
+                        pending.clear();
+                        let DerivationTree::Derived(derived) = tree else {
+                            unreachable!();
+                        };
+                        let cause1 = Arc::make_mut(&mut derived.cause1);
+                        let cause2 = Arc::make_mut(&mut derived.cause2);
+                        trees.push(cause2);
+                        trees.push(cause1);
+                        break;
                     }
                 }
+            }
+        }
+    }
+
+    fn assert_no_versions_not_root(&self) {
+        let mut trees = vec![self];
+        while let Some(tree) = trees.pop() {
+            if let DerivationTree::Derived(derived) = tree {
+                if matches!(
+                    (derived.cause1.deref(), derived.cause2.deref()),
+                    (
+                        DerivationTree::External(External::NoVersions(_, _)),
+                        DerivationTree::External(External::NotRoot(_, _)),
+                    ) | (
+                        DerivationTree::External(External::NotRoot(_, _)),
+                        DerivationTree::External(External::NoVersions(_, _)),
+                    )
+                ) {
+                    panic!("How did we end up with a NoVersions merged with a NotRoot?");
+                }
+                trees.push(&derived.cause2);
+                trees.push(&derived.cause1);
             }
         }
     }

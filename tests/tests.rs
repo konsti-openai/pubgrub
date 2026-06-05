@@ -226,3 +226,148 @@ fn collect_packages_from_deep_derivation_tree_without_stack_overflow() {
         assert_eq!(tree.packages().len(), 1_001);
     });
 }
+
+#[test]
+fn collapse_deep_derivation_tree_without_stack_overflow() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut tree = ManuallyDrop::new(deep_derivation_tree(1_000));
+            tree.collapse_no_versions();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn collapse_no_versions_preserves_pending_merges() {
+    let no_versions = |set| {
+        Arc::new(DerivationTree::External(External::NoVersions(
+            "foo".into(),
+            set,
+        )))
+    };
+    let inner = DerivationTree::Derived(Derived {
+        terms: Map::default(),
+        shared_id: None,
+        cause1: no_versions(Ranges::singleton(1u32)),
+        cause2: Arc::new(DerivationTree::External(External::FromDependencyOf(
+            "foo".into(),
+            Ranges::singleton(2u32),
+            "bar".into(),
+            Ranges::full(),
+        ))),
+    });
+    let mut tree = DerivationTree::<String, Ranges<u32>, Infallible>::Derived(Derived {
+        terms: Map::default(),
+        shared_id: None,
+        cause1: no_versions(Ranges::singleton(3u32)),
+        cause2: Arc::new(inner),
+    });
+
+    tree.collapse_no_versions();
+
+    let DerivationTree::External(External::FromDependencyOf(
+        package,
+        set,
+        dependency,
+        dependency_set,
+    )) = tree
+    else {
+        panic!("expected a collapsed dependency");
+    };
+    assert_eq!(package, "foo");
+    assert_eq!(dependency, "bar");
+    assert_eq!(dependency_set, Ranges::full());
+    assert!(set.contains(&1));
+    assert!(set.contains(&2));
+    assert!(set.contains(&3));
+    assert!(!set.contains(&4));
+}
+
+#[test]
+fn collapse_no_versions_reconstructs_failed_inner_merge() {
+    let no_versions = |package| {
+        Arc::new(DerivationTree::External(External::NoVersions(
+            package,
+            Ranges::empty(),
+        )))
+    };
+    let inner = DerivationTree::Derived(Derived {
+        terms: Map::default(),
+        shared_id: Some(1),
+        cause1: no_versions("inner".into()),
+        cause2: Arc::new(DerivationTree::External(External::Custom(
+            "custom".into(),
+            Ranges::full(),
+            "offline".to_string(),
+        ))),
+    });
+    let mut tree = DerivationTree::<String, Ranges<u32>, String>::Derived(Derived {
+        terms: Map::default(),
+        shared_id: Some(2),
+        cause1: no_versions("outer".into()),
+        cause2: Arc::new(inner),
+    });
+
+    tree.collapse_no_versions();
+
+    let DerivationTree::Derived(derived) = tree else {
+        panic!("expected the failed inner merge to remain derived");
+    };
+    assert_eq!(derived.shared_id, Some(1));
+    assert!(matches!(
+        derived.cause1.as_ref(),
+        DerivationTree::External(External::NoVersions(package, _)) if package == "inner"
+    ));
+    assert!(matches!(
+        derived.cause2.as_ref(),
+        DerivationTree::External(External::Custom(package, _, metadata))
+            if package == "custom" && metadata == "offline"
+    ));
+}
+
+#[test]
+fn collapse_no_versions_panics_before_rewriting_parent() {
+    let no_versions = || {
+        Arc::new(DerivationTree::External(External::NoVersions(
+            "missing".to_string(),
+            Ranges::empty(),
+        )))
+    };
+    let inner = DerivationTree::Derived(Derived {
+        terms: Map::default(),
+        shared_id: Some(1),
+        cause1: no_versions(),
+        cause2: Arc::new(DerivationTree::External(External::NotRoot(
+            "root".into(),
+            1,
+        ))),
+    });
+    let branch = DerivationTree::Derived(Derived {
+        terms: Map::default(),
+        shared_id: Some(3),
+        cause1: Arc::new(inner),
+        cause2: Arc::new(DerivationTree::External(External::FromDependencyOf(
+            "package".into(),
+            Ranges::full(),
+            "dependency".into(),
+            Ranges::full(),
+        ))),
+    });
+    let mut tree = DerivationTree::<String, Ranges<u32>, Infallible>::Derived(Derived {
+        terms: Map::default(),
+        shared_id: Some(2),
+        cause1: no_versions(),
+        cause2: Arc::new(branch),
+    });
+    let before = format!("{tree:?}");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tree.collapse_no_versions();
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(format!("{tree:?}"), before);
+}
