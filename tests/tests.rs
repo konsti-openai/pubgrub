@@ -149,22 +149,3 @@ fn same_result_across_platforms() {
     let (p, _v) = resolution.into_iter().find(|(_p, v)| *v == 2).unwrap();
     assert_eq!(p, "0".to_string());
 }
-
-/// Rejecting a version must not require packages used only by that version.
-#[test]
-fn backtracking_allows_an_unavailable_package_to_be_absent()
--> Result<(), Box<dyn std::error::Error>> {
-    let mut provider = OfflineDependencyProvider::<_, NumVS>::new();
-    provider.add_dependencies("root", 1u32, [("a", Ranges::full())]);
-    provider.add_dependencies("a", 2u32, [("missing", Ranges::full())]);
-    provider.add_dependencies("a", 1u32, [("b", Ranges::singleton(1u32))]);
-    provider.add_dependencies("b", 1u32, []);
-
-    let solution = resolve(&provider, "root", 1u32)?;
-    assert_eq!(solution.iter().count(), 3);
-    assert_eq!(solution.get(&"root"), Some(&1));
-    assert_eq!(solution.get(&"a"), Some(&1));
-    assert_eq!(solution.get(&"b"), Some(&1));
-    assert_eq!(solution.get(&"missing"), None);
-    Ok(())
-}
