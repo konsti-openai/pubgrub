@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! A Memory acts like a structured partial solution
-//! where terms are regrouped by package in a [Map](crate::type_aliases::Map).
+//! Package decisions and the derivations that constrain them.
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
 use std::fmt::{Debug, Display};
 use std::hash::BuildHasherDefault;
 use std::num::NonZeroU32;
@@ -12,12 +13,9 @@ use log::debug;
 use priority_queue::PriorityQueue;
 use rustc_hash::FxHasher;
 
-use crate::internal::{
-    Arena, HashArena, Id, IncompDpId, IncompId, Incompatibility, Relation, SmallMap, SmallVec,
-};
-use crate::{DependencyProvider, Package, Term, VersionSet};
+use crate::internal::{Arena, HashArena, Id, IncompDpId, IncompId, Incompatibility, Relation};
+use crate::{DependencyProvider, Map, Package, Term, VersionSet, term};
 
-type FnvIndexMap<K, V> = indexmap::IndexMap<K, V, BuildHasherDefault<FxHasher>>;
 type FnvIndexSet<T> = indexmap::IndexSet<T, BuildHasherDefault<FxHasher>>;
 
 /// The number of decisions that have been made at some point in solving.
@@ -66,26 +64,11 @@ const _: () = assert!(std::mem::size_of::<Option<DecisionLevel>>() == std::mem::
 #[derive(Clone, Debug)]
 pub struct PartialSolution<DP: DependencyProvider> {
     next_global_index: u32,
-    /// The number of decisions that have been made, equal to the number of packages with decisions.
-    current_decision_level: DecisionLevel,
-    /// Store for all known package decisions and package derivations.
-    ///
-    /// "assignment" refers to both packages with decisions and package with only derivations and
-    /// no decision yet. We combine this in a single index map with a decisions section in front and
-    /// a derivations sections in the back, where making a decision moves a package from the
-    /// derivations sections to the decisions section.
-    ///
-    /// `[..current_decision_level]`: Packages that have had a decision made, sorted by the
-    /// `decision_level`. The section is can be seen as the partial solution, it contains a
-    /// mapping from package name to decided version. The sorting makes it very efficient to
-    /// extract the solution, and to backtrack to a particular decision level. The
-    /// `AssignmentsIntersection` is always a `Decision`.
-    ///
-    /// `[current_decision_level..]`: Packages that are dependencies of some other package,
-    /// but have not yet been decided. The `AssignmentsIntersection` is always a `Derivations`, the
-    /// derivations store the obligations from the decided packages.
+    /// Current decisions and derivation histories, indexed by package.
     #[allow(clippy::type_complexity)]
-    package_assignments: FnvIndexMap<Id<DP::P>, PackageAssignments<DP::P, DP::VS, DP::M>>,
+    package_assignments: Map<Id<DP::P>, PackageAssignments<DP::P, DP::VS, DP::M>>,
+    /// Packages in decision order; a backtrack truncates this list.
+    decided_packages: Vec<Id<DP::P>>,
     /// The undecided packages order by their `Priority`.
     ///
     /// The max heap allows quickly `pop`ing the highest priority package.
@@ -103,18 +86,17 @@ pub struct PartialSolution<DP: DependencyProvider> {
     last_valid_decision_levels: Vec<DecisionLevel>,
 }
 
-/// A package assignment is either a decision or a list of (accumulated) derivations without a
-/// decision.
+/// The derivation history for a package and its optional selected version.
 #[derive(Clone, Debug)]
 struct PackageAssignments<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
-    /// Whether the assigment is a decision or a derivation.
-    assignments_intersection: AssignmentsIntersection<VS>,
+    /// The selected version, if a decision has been made.
+    decision: Option<Decision<VS::V>>,
     /// All constraints on the package version from previous decisions, accumulated by decision
     /// level.
-    dated_derivations: SmallVec<DatedDerivation<P, VS, M>>,
+    dated_derivations: Vec<DatedDerivation<P, VS, M>>,
     /// Smallest [`DecisionLevel`] in `dated_derivations`.
     smallest_decision_level: DecisionLevel,
-    /// Highest [`DecisionLevel`] in `dated_derivations`.
+    /// Level of the latest assignment, including a decision when present.
     highest_decision_level: DecisionLevel,
 }
 
@@ -129,11 +111,11 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Display
             .collect();
         write!(
             f,
-            "decision range: {:?}..{:?}\nderivations:\n  {}\n,assignments_intersection: {}",
+            "decision range: {:?}..{:?}\nderivations:\n  {}\n,decision: {:?}",
             self.smallest_decision_level,
             self.highest_decision_level,
             derivations.join("\n  "),
-            self.assignments_intersection
+            self.decision
         )
     }
 }
@@ -160,30 +142,9 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Display
 }
 
 #[derive(Clone, Debug)]
-enum AssignmentsIntersection<VS: VersionSet> {
-    /// A decision on package for version has been made at the given level.
-    Decision {
-        decision_level: u32,
-        version: VS::V,
-        /// The version, but as positive singleton term.
-        term: Term<VS>,
-    },
-    Derivations(Term<VS>),
-}
-
-impl<VS: VersionSet> Display for AssignmentsIntersection<VS> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Decision {
-                decision_level,
-                version,
-                term: _,
-            } => {
-                write!(f, "Decision: level {decision_level}, v = {version}")
-            }
-            Self::Derivations(term) => write!(f, "Derivations term: {term}"),
-        }
-    }
+struct Decision<V> {
+    global_index: u32,
+    version: V,
 }
 
 #[derive(Clone, Debug)]
@@ -198,15 +159,19 @@ pub(crate) enum SatisfierSearch<P: Package, VS: VersionSet, M: Eq + Clone + Debu
     },
 }
 
-type SatisfiedMap<P, VS, M> = SmallMap<Id<P>, (Option<IncompId<P, VS, M>>, u32, DecisionLevel)>;
+struct Satisfier<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
+    cause: Option<IncompId<P, VS, M>>,
+    global_index: u32,
+    decision_level: DecisionLevel,
+}
 
 impl<DP: DependencyProvider> PartialSolution<DP> {
     /// Initialize an empty PartialSolution.
     pub(crate) fn empty() -> Self {
         Self {
             next_global_index: 0,
-            current_decision_level: DecisionLevel::ZERO,
-            package_assignments: FnvIndexMap::default(),
+            package_assignments: Map::default(),
+            decided_packages: Vec::new(),
             prioritized_potential_packages: PriorityQueue::default(),
             outdated_priorities: FnvIndexSet::default(),
             last_valid_decision_levels: vec![DecisionLevel::ZERO],
@@ -251,7 +216,7 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
                     f,
                     "next_global_index: {}\ncurrent_decision_level: {:?}\npackage_assignments:\n{}",
                     self.0.next_global_index,
-                    self.0.current_decision_level,
+                    self.0.current_decision_level(),
                     assignments.join("\t\n")
                 )
             }
@@ -262,41 +227,23 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
 
     /// Add a decision.
     pub fn add_decision(&mut self, package: Id<DP::P>, version: DP::V) {
-        // Check that add_decision is never used in the wrong context.
-        if cfg!(debug_assertions) {
-            match self.package_assignments.get_mut(&package) {
-                None => panic!("Derivations must already exist"),
-                Some(pa) => match &pa.assignments_intersection {
-                    // Cannot be called when a decision has already been taken.
-                    AssignmentsIntersection::Decision { .. } => {
-                        panic!("Already existing decision")
-                    }
-                    // Cannot be called if the versions is not contained in the terms' intersection.
-                    AssignmentsIntersection::Derivations(term) => {
-                        debug_assert!(
-                            term.contains(&version),
-                            "{package:?}: {version} was expected to be contained in {term}",
-                        )
-                    }
-                },
-            }
-        }
-        let new_idx = self.current_decision_level.get() as usize;
-        self.current_decision_level = self.current_decision_level.increment();
-        let (old_idx, _, pa) = self
+        let decision_level = self.current_decision_level().increment();
+        let pa = self
             .package_assignments
-            .get_full_mut(&package)
+            .get_mut(&package)
             .expect("Derivations must already exist");
-        pa.highest_decision_level = self.current_decision_level;
-        pa.assignments_intersection = AssignmentsIntersection::Decision {
-            decision_level: self.next_global_index,
-            version: version.clone(),
-            term: Term::exact(version),
-        };
-        // Maintain that the beginning of the `package_assignments` Have all decisions in sorted order.
-        if new_idx != old_idx {
-            self.package_assignments.swap_indices(new_idx, old_idx);
-        }
+        debug_assert!(pa.decision.is_none(), "Already existing decision");
+        debug_assert!(
+            pa.derivations().contains(&version),
+            "{package:?}: {version} was expected to be contained in {}",
+            pa.derivations(),
+        );
+        pa.highest_decision_level = decision_level;
+        pa.decision = Some(Decision {
+            global_index: self.next_global_index,
+            version,
+        });
+        self.decided_packages.push(package);
         self.next_global_index += 1;
     }
 
@@ -322,10 +269,9 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         cause: IncompDpId<DP>,
         store: &Arena<Incompatibility<DP::P, DP::VS, DP::M>>,
     ) {
-        use indexmap::map::Entry;
         let term = store[cause].get(package).unwrap();
         let global_index = self.next_global_index;
-        let decision_level = self.current_decision_level;
+        let decision_level = self.current_decision_level();
         self.next_global_index += 1;
         let dated_derivation = |accumulated_intersection| DatedDerivation {
             global_index,
@@ -334,35 +280,30 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
             accumulated_intersection,
         };
         match self.package_assignments.entry(package) {
-            Entry::Occupied(mut occupied) => {
-                let pa = occupied.get_mut();
-                pa.highest_decision_level = self.current_decision_level;
-                let accumulated_intersection = match &mut pa.assignments_intersection {
-                    // Check that add_derivation is never called in the wrong context.
-                    AssignmentsIntersection::Decision { .. } => {
-                        panic!("add_derivation should not be called after a decision")
-                    }
-                    AssignmentsIntersection::Derivations(t) => {
-                        *t = t.difference(term);
-                        if t.is_positive() {
-                            self.outdated_priorities.insert(package);
-                        }
-                        t.clone()
-                    }
-                };
+            Entry::Occupied(mut entry) => {
+                let pa = entry.get_mut();
+                pa.highest_decision_level = decision_level;
+                assert!(
+                    pa.decision.is_none(),
+                    "add_derivation should not be called after a decision"
+                );
+                let accumulated_intersection = pa.derivations().difference(term);
+                if accumulated_intersection.is_positive() {
+                    self.outdated_priorities.insert(package);
+                }
                 pa.dated_derivations
                     .push(dated_derivation(accumulated_intersection));
             }
-            Entry::Vacant(v) => {
+            Entry::Vacant(entry) => {
                 let term = term.negate();
                 if term.is_positive() {
                     self.outdated_priorities.insert(package);
                 }
-                v.insert(PackageAssignments {
-                    smallest_decision_level: self.current_decision_level,
-                    highest_decision_level: self.current_decision_level,
-                    dated_derivations: SmallVec::One([dated_derivation(term.clone())]),
-                    assignments_intersection: AssignmentsIntersection::Derivations(term),
+                entry.insert(PackageAssignments {
+                    smallest_decision_level: decision_level,
+                    highest_decision_level: decision_level,
+                    dated_derivations: vec![dated_derivation(term)],
+                    decision: None,
                 });
             }
         }
@@ -371,15 +312,11 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
     #[cold]
     pub fn prioritized_packages(&self) -> impl Iterator<Item = (Id<DP::P>, &DP::VS)> {
         // TODO(konsti): Should we use `self.outdated_priorities` instead?
-        let current_decision_level = self.current_decision_level;
+        let current_decision_level = self.current_decision_level();
         self.package_assignments
-            .get_range(self.current_decision_level.get() as usize..)
-            .unwrap()
             .iter()
             .filter(move |(_, pa)| pa.highest_decision_level == current_decision_level)
-            .filter_map(|(&p, pa)| {
-                Some((p, pa.assignments_intersection.potential_package_filter()?))
-            })
+            .filter_map(|(p, pa)| Some((*p, pa.potential_package_filter()?)))
     }
 
     #[cold]
@@ -387,76 +324,53 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         &mut self,
         mut prioritizer: impl FnMut(Id<DP::P>, &DP::VS) -> DP::Priority,
     ) -> Option<(Id<DP::P>, &DP::VS)> {
+        let package_assignments = &self.package_assignments;
         let prioritized_potential_packages = &mut self.prioritized_potential_packages;
         while let Some(p) = self.outdated_priorities.pop() {
-            let Some(pa) = self.package_assignments.get(&p) else {
+            let Some(pa) = package_assignments.get(&p) else {
                 continue;
             };
-            let Some(r) = pa.assignments_intersection.potential_package_filter() else {
+            let Some(r) = pa.potential_package_filter() else {
                 continue;
             };
             let priority = prioritizer(p, r);
             prioritized_potential_packages.push(p, (priority, Reverse(p.into_raw() as u32)));
         }
         while let Some(p) = self.prioritized_potential_packages.pop().map(|(p, _)| p) {
-            let Some(pa) = self.package_assignments.get(&p) else {
+            let Some(pa) = package_assignments.get(&p) else {
                 continue;
             };
-            if let Some(r) = pa.assignments_intersection.potential_package_filter() {
+            if let Some(r) = pa.potential_package_filter() {
                 return Some((p, r));
             }
         }
         None
     }
 
-    /// If a partial solution has, for every positive derivation,
+    /// If a partial solution has, for every derivation that requires a package,
     /// a corresponding decision that satisfies that assignment,
     /// it's a total solution and version solving has succeeded.
     pub fn extract_solution(&self) -> impl Iterator<Item = (Id<DP::P>, DP::V)> + '_ {
-        self.package_assignments
-            .iter()
-            .take(self.current_decision_level.get() as usize)
-            .map(|(&p, pa)| match &pa.assignments_intersection {
-                AssignmentsIntersection::Decision {
-                    decision_level: _,
-                    version: v,
-                    term: _,
-                } => (p, v.clone()),
-                AssignmentsIntersection::Derivations(_) => {
-                    // The invariant on the order in `self.package_assignments` was broken.
-                    let mut context = String::new();
-                    for (id, assignment) in self
-                        .package_assignments
-                        .iter()
-                        .take(self.current_decision_level.get() as usize)
-                    {
-                        context.push_str(&format!(
-                            " * {:?} {:?}\n",
-                            id, assignment.assignments_intersection
-                        ));
-                    }
-                    panic!(
-                        "Derivations in the Decision part. Decision level {}\n{}",
-                        self.current_decision_level.get(),
-                        context
-                    )
-                }
-            })
+        self.decided_packages.iter().map(|&package| {
+            let decision = self
+                .assignments(package)
+                .and_then(|pa| pa.decision.as_ref())
+                .expect("Every decided package has a version");
+            (package, decision.version.clone())
+        })
     }
 
     /// Backtrack the partial solution to a given decision level.
     pub(crate) fn backtrack(&mut self, decision_level: DecisionLevel) {
-        self.current_decision_level = decision_level;
+        self.decided_packages
+            .truncate(decision_level.get() as usize);
         self.package_assignments.retain(|p, pa| {
             if pa.smallest_decision_level > decision_level {
                 // Remove all entries that have a smallest decision level higher than the backtrack target.
                 false
             } else if pa.highest_decision_level <= decision_level {
                 // Do not change entries older than the backtrack decision level target.
-                if pa
-                    .assignments_intersection
-                    .potential_package_filter()
-                    .is_some()
+                if pa.potential_package_filter().is_some()
                     && self.prioritized_potential_packages.get(p).is_none()
                 {
                     self.outdated_priorities.insert(*p);
@@ -482,12 +396,10 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
                 // Update highest_decision_level.
                 pa.highest_decision_level = last.decision_level;
 
-                // Reset the assignments intersection.
-                pa.assignments_intersection =
-                    AssignmentsIntersection::Derivations(last.accumulated_intersection.clone());
+                pa.decision = None;
 
                 self.prioritized_potential_packages.remove(p);
-                if pa.assignments_intersection.term().is_positive() {
+                if pa.derivations().is_positive() {
                     self.outdated_priorities.insert(*p);
                 }
                 true
@@ -510,14 +422,9 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
     /// Returns the new decision level on success and an error if the package was not decided on
     /// yet.
     pub(crate) fn backtrack_package(&mut self, package: Id<DP::P>) -> Result<DecisionLevel, ()> {
-        let Some(decision_level) = self.package_assignments.get_index_of(&package) else {
-            return Err(());
-        };
-        let decision_level = DecisionLevel::new(decision_level as u32);
-        // Decisions occupy indices strictly below the current decision level.
-        if decision_level >= self.current_decision_level {
-            return Err(());
-        }
+        let pa = self.assignments(package).ok_or(())?;
+        pa.decision.as_ref().ok_or(())?;
+        let decision_level = DecisionLevel::new(pa.highest_decision_level.get() - 1);
         debug!(
             "Package backtracking ot decision level {}",
             decision_level.get()
@@ -551,14 +458,13 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         }
 
         // Check if any of the dependencies preclude deciding on this crate version.
-        let package_term = Term::exact(version.clone());
         let relation = |incompat: IncompId<DP::P, DP::VS, DP::M>| {
-            store[incompat].relation(|p| {
+            store[incompat].relation(|p, term| {
                 // The current package isn't part of the package assignments yet.
                 if p == package {
-                    Some(&package_term)
+                    Some(term.relation_with_version(&version))
                 } else {
-                    self.term_intersection_for_package(p)
+                    self.assignments(p).map(|pa| pa.relation(term))
                 }
             })
         };
@@ -581,14 +487,12 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         &self,
         incompat: &Incompatibility<DP::P, DP::VS, DP::M>,
     ) -> Relation<DP::P> {
-        incompat.relation(|package| self.term_intersection_for_package(package))
+        incompat.relation(|package, term| self.assignments(package).map(|pa| pa.relation(term)))
     }
 
-    /// Retrieve intersection of terms related to package.
-    pub fn term_intersection_for_package(&self, package: Id<DP::P>) -> Option<&Term<DP::VS>> {
-        self.package_assignments
-            .get(&package)
-            .map(|pa| pa.assignments_intersection.term())
+    /// The allowed versions when an undecided package is required by the partial solution.
+    pub fn required_versions_for_package(&self, package: Id<DP::P>) -> Option<&DP::VS> {
+        self.assignments(package)?.potential_package_filter()
     }
 
     /// Figure out if the satisfier and previous satisfier are of different decision levels.
@@ -598,39 +502,44 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         incompat: &Incompatibility<DP::P, DP::VS, DP::M>,
         store: &Arena<Incompatibility<DP::P, DP::VS, DP::M>>,
     ) -> (Id<DP::P>, SatisfierSearch<DP::P, DP::VS, DP::M>) {
-        let satisfied_map = Self::find_satisfier(incompat, &self.package_assignments);
-        let (&satisfier_package, &(satisfier_cause, _, satisfier_decision_level)) = satisfied_map
-            .iter()
-            .max_by_key(|(_p, (_, global_index, _))| global_index)
-            .unwrap();
-        let satisfier_pa = self.package_assignments.get(&satisfier_package).unwrap();
-        let incompat_term = incompat.get(satisfier_package).unwrap();
+        let (satisfier_package, satisfier, previous_satisfier_level) =
+            self.find_satisfier(incompat);
+        let satisfier_pa = self
+            .assignments(satisfier_package)
+            .expect("Satisfier must exist");
+        let incompat_term = incompat
+            .get(satisfier_package)
+            .expect("Satisfier must belong to incompatibility");
+
+        let Some(satisfier_cause) = satisfier.cause else {
+            // A decision satisfies this term on its own. Its first derivation bounds how
+            // far back the package can remain in the partial solution.
+            debug_assert!(
+                satisfier_pa
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| { incompat_term.contains(&decision.version) })
+            );
+            let previous_satisfier_level =
+                previous_satisfier_level.max(satisfier_pa.dated_derivations[0].decision_level);
+            debug_assert!(previous_satisfier_level < satisfier.decision_level);
+            return (
+                satisfier_package,
+                SatisfierSearch::DifferentDecisionLevels {
+                    previous_satisfier_level,
+                },
+            );
+        };
 
         // If the satisfier derives `not cause`, earlier assignments must satisfy
         // `incompat or cause`: (earlier and not cause) implies incompat.
-        // This is also the term used by the rule of resolution, so compute it only once.
-        let resolved_term = if let Some(cause) = satisfier_cause {
-            incompat_term.union(store[cause].get(satisfier_package).unwrap())
-        } else {
-            // A decision satisfies the incompatibility term on its own.
-            debug_assert!(
-                satisfier_pa
-                    .assignments_intersection
-                    .term()
-                    .subset_of(incompat_term)
-            );
-            Term::any()
-        };
-        // Decision levels are nondecreasing in the active assignment history. Only the
-        // level of the latest previous satisfier matters, not its position within that level.
-        let previous_satisfier_level = satisfied_map
-            .iter()
-            .filter(|(package, _)| **package != satisfier_package)
-            .map(|(_, (_, _, level))| *level)
-            .max()
-            .unwrap_or(DecisionLevel::new(1))
-            .max(DecisionLevel::new(1));
-        let previous_satisfier_level = if previous_satisfier_level >= satisfier_decision_level {
+        // The rule of resolution needs the same union.
+        let resolved_term = incompat_term.union(
+            store[satisfier_cause]
+                .get(satisfier_package)
+                .expect("Cause must constrain the satisfier"),
+        );
+        let previous_satisfier_level = if previous_satisfier_level >= satisfier.decision_level {
             // Another package already prevents backtracking below the satisfier's level.
             // Searching this package's history cannot change that outcome.
             previous_satisfier_level
@@ -640,13 +549,13 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
                 // as the historical lower bound without comparing version sets.
                 satisfier_pa.dated_derivations[0].decision_level
             } else {
-                satisfier_pa.satisfier(satisfier_package, &resolved_term).2
+                satisfier_pa.satisfier(&resolved_term).decision_level
             };
             previous_satisfier_level.max(level)
         };
-        let search_result = if previous_satisfier_level >= satisfier_decision_level {
+        let search_result = if previous_satisfier_level >= satisfier.decision_level {
             SatisfierSearch::SameDecisionLevels {
-                satisfier_cause: satisfier_cause.unwrap(),
+                satisfier_cause,
                 resolved_term,
             }
         } else {
@@ -657,51 +566,63 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         (satisfier_package, search_result)
     }
 
-    /// A satisfier is the earliest assignment in partial solution such that the incompatibility
-    /// is satisfied by the partial solution up to and including that assignment.
-    ///
-    /// Returns a map indicating for each package term, when that was first satisfied in history.
-    /// If we effectively found a satisfier, the returned map must be the same size that incompat.
-    ///
-    /// Question: This is possible since we added a "global_index" to every dated_derivation.
-    /// It would be nice if we could get rid of it, but I don't know if then it will be possible
-    /// to return a coherent previous_satisfier_level.
-    #[allow(clippy::type_complexity)]
+    /// Find the latest package satisfier and the highest decision level among the others.
+    #[expect(clippy::type_complexity)]
     fn find_satisfier(
+        &self,
         incompat: &Incompatibility<DP::P, DP::VS, DP::M>,
-        package_assignments: &FnvIndexMap<Id<DP::P>, PackageAssignments<DP::P, DP::VS, DP::M>>,
-    ) -> SatisfiedMap<DP::P, DP::VS, DP::M> {
-        let mut satisfied = SmallMap::Empty;
-        for (package, incompat_term) in incompat.iter() {
-            let pa = package_assignments.get(&package).expect("Must exist");
-            satisfied.insert(package, pa.satisfier(package, incompat_term));
+    ) -> (Id<DP::P>, Satisfier<DP::P, DP::VS, DP::M>, DecisionLevel) {
+        let mut satisfiers = incompat.iter().map(|(package, term)| {
+            let assignments = self.assignments(package).expect("Must exist");
+            (package, assignments.satisfier(term))
+        });
+        let (mut package, mut satisfier) = satisfiers
+            .next()
+            .expect("Terminal incompatibilities are handled before satisfier search");
+        let mut previous_level = DecisionLevel::new(1);
+        for (candidate_package, candidate) in satisfiers {
+            if candidate.global_index >= satisfier.global_index {
+                previous_level = previous_level.max(satisfier.decision_level);
+                package = candidate_package;
+                satisfier = candidate;
+            } else {
+                previous_level = previous_level.max(candidate.decision_level);
+            }
         }
-        satisfied
+        (package, satisfier, previous_level)
+    }
+
+    fn assignments(&self, package: Id<DP::P>) -> Option<&PackageAssignments<DP::P, DP::VS, DP::M>> {
+        self.package_assignments.get(&package)
     }
 
     pub(crate) fn current_decision_level(&self) -> DecisionLevel {
-        self.current_decision_level
+        DecisionLevel::new(self.decided_packages.len() as u32)
     }
 
-    /// Retrieve the constraints on a package that will not change.
-    pub fn unchanging_term_for_package(&self, package: Id<DP::P>) -> Option<&Term<DP::VS>> {
-        let pa = self.package_assignments.get(&package)?;
+    /// The allowed versions that will not change through backtracking.
+    ///
+    /// This does not imply the package must be selected. It bounds candidate
+    /// prefetching even when the package may still be absent.
+    pub fn unchanging_versions_for_package(&self, package: Id<DP::P>) -> Option<Cow<'_, DP::VS>> {
+        let pa = self.assignments(package)?;
 
         let idx_newer = pa
             .dated_derivations
             .as_slice()
             .partition_point(|dd| dd.decision_level <= DecisionLevel::new(1));
         let idx = idx_newer.checked_sub(1)?;
-        Some(&pa.dated_derivations[idx].accumulated_intersection)
+        let term = &pa.dated_derivations[idx].accumulated_intersection;
+        Some(if term.negative {
+            Cow::Owned(term.set.complement())
+        } else {
+            Cow::Borrowed(&term.set)
+        })
     }
 }
 
 impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> PackageAssignments<P, VS, M> {
-    fn satisfier(
-        &self,
-        package: Id<P>,
-        term: &Term<VS>,
-    ) -> (Option<IncompId<P, VS, M>>, u32, DecisionLevel) {
+    fn satisfier(&self, term: &Term<VS>) -> Satisfier<P, VS, M> {
         // Indicate if we found a satisfier in the list of derivations, otherwise it will be the decision.
         let idx = self
             .dated_derivations
@@ -712,59 +633,50 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> PackageAssignm
                 dd.accumulated_intersection.intersection(term),
                 dd.accumulated_intersection
             );
-            return (Some(dd.cause), dd.global_index, dd.decision_level);
+            return Satisfier {
+                cause: Some(dd.cause),
+                global_index: dd.global_index,
+                decision_level: dd.decision_level,
+            };
         }
         // If it wasn't found in the derivations,
         // it must be the decision which is last (if called in the right context).
-        match &self.assignments_intersection {
-            AssignmentsIntersection::Decision {
-                decision_level: global_index,
-                version: _,
-                term: _,
-            } => (None, *global_index, self.highest_decision_level),
-            AssignmentsIntersection::Derivations(accumulated_intersection) => {
-                unreachable!(
-                    concat!(
-                        "while processing package {:?}: ",
-                        "accum_term = {} does not satisfy incompat_term = {}, ",
-                        "which means the last assignment should have been a decision, ",
-                        "but instead it was a derivation. This shouldn't be possible! ",
-                        "(Maybe your Version ordering is broken?)"
-                    ),
-                    package, accumulated_intersection, term
-                )
-            }
-        }
-    }
-}
-
-impl<VS: VersionSet> AssignmentsIntersection<VS> {
-    /// Returns the term intersection of all assignments (decision included).
-    fn term(&self) -> &Term<VS> {
-        match self {
-            Self::Decision {
-                decision_level: _,
-                version: _,
-                term,
-            } => term,
-            Self::Derivations(term) => term,
+        let decision = self
+            .decision
+            .as_ref()
+            .expect("The last assignment must satisfy the term");
+        debug_assert!(term.contains(&decision.version));
+        Satisfier {
+            cause: None,
+            global_index: decision.global_index,
+            decision_level: self.highest_decision_level,
         }
     }
 
-    /// A package is a potential pick if there isn't an already
-    /// selected version (no "decision")
-    /// and if it contains at least one positive derivation term
-    /// in the partial solution.
+    /// The last history entry owns the intersection of all derivations.
+    fn derivations(&self) -> &Term<VS> {
+        &self
+            .dated_derivations
+            .last()
+            .expect("Derivations must exist")
+            .accumulated_intersection
+    }
+
+    fn relation(&self, term: &Term<VS>) -> term::Relation {
+        if let Some(decision) = &self.decision {
+            term.relation_with_version(&decision.version)
+        } else {
+            term.relation_with(self.derivations())
+        }
+    }
+
+    /// An undecided package is a potential pick when its derivations require it.
     fn potential_package_filter(&self) -> Option<&VS> {
-        match self {
-            Self::Decision { .. } => None,
-            Self::Derivations(term_intersection) => {
-                if term_intersection.is_positive() {
-                    Some(term_intersection.unwrap_positive())
-                } else {
-                    None
-                }
-            }
+        if self.decision.is_some() {
+            None
+        } else {
+            let term = self.derivations();
+            term.is_positive().then_some(&term.set)
         }
     }
 }

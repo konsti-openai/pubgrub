@@ -58,11 +58,6 @@ impl<VS: VersionSet> Term<VS> {
         Self::positive(VS::empty())
     }
 
-    /// A positive term containing exactly that version.
-    pub(crate) fn exact(version: VS::V) -> Self {
-        Self::positive(VS::singleton(version))
-    }
-
     /// Simply check if a term is positive.
     pub(crate) fn is_positive(&self) -> bool {
         !self.negative
@@ -81,6 +76,15 @@ impl<VS: VersionSet> Term<VS> {
     /// Evaluate a term regarding a given choice of version.
     pub(crate) fn contains(&self, v: &VS::V) -> bool {
         self.set.contains(v) ^ self.negative
+    }
+
+    /// A selected version either satisfies or contradicts a term.
+    pub(crate) fn relation_with_version(&self, version: &VS::V) -> Relation {
+        if self.contains(version) {
+            Relation::Satisfied
+        } else {
+            Relation::Contradicted
+        }
     }
 
     /// Unwrap the set contained in a positive term.
@@ -172,6 +176,7 @@ impl<VS: VersionSet> Term<VS> {
 ///
 /// As a shorthand, we say that a term v
 /// satisfies or contradicts a term t if {v} satisfies or contradicts it.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Relation {
     /// We say that a set of terms S "satisfies" a term t
     /// if t must be true whenever every term in S is true.
@@ -334,6 +339,14 @@ pub mod tests {
     }
 
     proptest! {
+
+        #[test]
+        fn selected_version_relation(term in strategy(), version in any::<u32>()) {
+            prop_assert_eq!(
+                term.relation_with_version(&version),
+                term.relation_with(&Term::positive(Ranges::singleton(version)))
+            );
+        }
 
         // Testing relation --------------------------------
 

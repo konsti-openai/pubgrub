@@ -394,14 +394,15 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibilit
     }
 }
 
-impl<'a, P: Package, VS: VersionSet + 'a, M: Eq + Clone + Debug + Display + 'a>
-    Incompatibility<P, VS, M>
-{
+impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibility<P, VS, M> {
     /// CF definition of Relation enum.
-    pub(crate) fn relation(&self, terms: impl Fn(Id<P>) -> Option<&'a Term<VS>>) -> Relation<P> {
+    pub(crate) fn relation(
+        &self,
+        terms: impl Fn(Id<P>, &Term<VS>) -> Option<term::Relation>,
+    ) -> Relation<P> {
         let mut relation = Relation::Satisfied;
         for (&package, incompat_term) in self.package_terms.iter() {
-            match terms(package).map(|term| incompat_term.relation_with(term)) {
+            match terms(package, incompat_term) {
                 Some(term::Relation::Satisfied) => {}
                 Some(term::Relation::Contradicted) => {
                     return Relation::Contradicted(package);
